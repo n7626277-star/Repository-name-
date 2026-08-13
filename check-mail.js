@@ -1,25 +1,17 @@
-const { google } = require('googleapis');
+const { ImapFlow } = require('imapflow');
+const { simpleParser } = require('mailparser');
+const nodemailer = require('nodemailer');
 
-const CLIENT_ID = process.env.GMAIL_CLIENT_ID;
-const CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
-const REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
+const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_APP_PASSWORD = process.env.EMAIL_APP_PASSWORD;
 const DOWNLOAD_SERVER = process.env.DOWNLOAD_SERVER_URL; // לדוגמה: https://repository-name-0tf0.onrender.com
 
-const PROCESSED_LABEL_NAME = 'טופל-קישור-דרייב';
+const PROCESSED_FLAG = 'DriveBotProcessed'; // תווית IMAP מותאמת אישית לסימון מיילים שכבר טופלו
 
-if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN || !DOWNLOAD_SERVER) {
-  console.error('חסרים משתני סביבה נדרשים (GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN / DOWNLOAD_SERVER_URL)');
+if (!EMAIL_USER || !EMAIL_APP_PASSWORD || !DOWNLOAD_SERVER) {
+  console.error('חסרים משתני סביבה נדרשים (EMAIL_USER / EMAIL_APP_PASSWORD / DOWNLOAD_SERVER_URL)');
   process.exit(1);
 }
-
-const oauth2Client = new google.auth.OAuth2(
-  CLIENT_ID,
-  CLIENT_SECRET,
-  'https://developers.google.com/oauthplayground'
-);
-oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
-
-const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
 // מחלץ File ID מתוך קישור Google Drive
 function extractFileId(text) {
@@ -35,112 +27,93 @@ function extractFileId(text) {
   return null;
 }
 
-// מוצא, או יוצר אם לא קיימת, תווית (label) לסימון מיילים שכבר טופלו
-async function getOrCreateLabel(name) {
-  const res = await gmail.users.labels.list({ userId: 'me' });
-  const existing = (res.data.labels || []).find((l) => l.name === name);
-  if (existing) return existing.id;
-
-  const created = await gmail.users.labels.create({
-    userId: 'me',
-    requestBody: { name, labelListVisibility: 'labelShow', messageListVisibility: 'show' }
-  });
-  return created.data.id;
-}
-
-function getHeader(headers, name) {
-  const h = (headers || []).find((h) => h.name.toLowerCase() === name.toLowerCase());
-  return h ? h.value : '';
-}
-
-// שולף טקסט (plain/html) מגוף המייל, כולל חלקים מקוננים
-function decodeBody(payload) {
-  let text = '';
-  function walk(part) {
-    if (!part) return;
-    if (part.body && part.body.data && (part.mimeType === 'text/plain' || part.mimeType === 'text/html')) {
-      text += Buffer.from(part.body.data, 'base64').toString('utf-8') + '\n';
-    }
-    if (part.parts) part.parts.forEach(walk);
-  }
-  walk(payload);
-  return text;
-}
-
-// בונה מייל תשובה גולמי (RFC 2822) מקודד ב-base64url, כפי שדורש Gmail API
-function buildReplyRaw({ to, subject, inReplyTo, bodyText }) {
-  const replySubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
-  const lines = [
-    `To: ${to}`,
-    `Subject: =?UTF-8?B?${Buffer.from(replySubject, 'utf-8').toString('base64')}?=`,
-    inReplyTo ? `In-Reply-To: ${inReplyTo}` : '',
-    inReplyTo ? `References: ${inReplyTo}` : '',
-    'Content-Type: text/plain; charset=UTF-8',
-    '',
-    bodyText
-  ].filter(Boolean);
-
-  return Buffer.from(lines.join('\r\n'))
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-}
-
 async function main() {
-  const labelId = await getOrCreateLabel(PROCESSED_LABEL_NAME);
-
-  const list = await gmail.users.messages.list({
-    userId: 'me',
-    q: `in:inbox drive.google.com -label:"${PROCESSED_LABEL_NAME}"`,
-    maxResults: 20
+  const client = new ImapFlow({
+    host: 'imap.gmail.com',
+    port: 993,
+    secure: true,
+    auth: { user: EMAIL_USER, pass: EMAIL_APP_PASSWORD },
+    logger: false
   });
 
-  const messages = list.data.messages || [];
-  console.log(`נמצאו ${messages.length} מיילים לבדיקה`);
+  const transporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    auth: { user: EMAIL_USER, pass: EMAIL_APP_PASSWORD }
+  });
 
-  for (const m of messages) {
-    const full = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'full' });
-    const headers = full.data.payload.headers;
-    const from = getHeader(headers, 'From');
-    const subject = getHeader(headers, 'Subject') || '(ללא נושא)';
-    const messageIdHeader = getHeader(headers, 'Message-ID');
-    const bodyText = decodeBody(full.data.payload) + ' ' + (full.data.snippet || '');
+  await client.connect();
 
-    const urlMatch = bodyText.match(/https?:\/\/drive\.google\.com\/[^\s"'<>]+/);
-    const fileId = urlMatch ? extractFileId(urlMatch[0]) : extractFileId(bodyText);
+  const lock = await client.getMailboxLock('INBOX');
+  try {
+    // מחפשים מיילים שמכילים "drive.google.com" בגוף ההודעה
+    const uids = await client.search({ body: 'drive.google.com' });
 
-    if (!fileId) {
-      console.log(`מייל ${m.id}: לא נמצא קישור דרייב תקין, מסמן ומדלג`);
-      await gmail.users.messages.modify({ userId: 'me', id: m.id, requestBody: { addLabelIds: [labelId] } });
-      continue;
+    console.log(`נמצאו ${uids.length} מיילים תואמי חיפוש, בודק מי מהם עוד לא טופל...`);
+
+    for (const uid of uids) {
+      const msg = await client.fetchOne(uid, { source: true, flags: true });
+      const flags = Array.from(msg.flags || []);
+
+      if (flags.includes(PROCESSED_FLAG)) {
+        continue; // כבר טופל בעבר
+      }
+
+      const parsed = await simpleParser(msg.source);
+      const bodyText = (parsed.text || '') + ' ' + (parsed.html || '');
+
+      const urlMatch = bodyText.match(/https?:\/\/drive\.google\.com\/[^\s"'<>]+/);
+      const fileId = urlMatch ? extractFileId(urlMatch[0]) : extractFileId(bodyText);
+
+      if (!fileId) {
+        console.log(`UID ${uid}: לא נמצא קישור דרייב תקין בגוף ההודעה, מסמן ומדלג`);
+        await client.messageFlagsAdd(uid, [PROCESSED_FLAG]);
+        continue;
+      }
+
+      const previewLink = `${DOWNLOAD_SERVER}/preview/${fileId}`;
+      const downloadLink = `${DOWNLOAD_SERVER}/download/${fileId}`;
+
+      const fromAddress = parsed.from && parsed.from.value && parsed.from.value[0]
+        ? parsed.from.value[0].address
+        : null;
+
+      if (!fromAddress) {
+        console.log(`UID ${uid}: לא נמצאה כתובת שולח, מסמן ומדלג`);
+        await client.messageFlagsAdd(uid, [PROCESSED_FLAG]);
+        continue;
+      }
+
+      const subject = parsed.subject || '(ללא נושא)';
+      const replySubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
+
+      await transporter.sendMail({
+        from: EMAIL_USER,
+        to: fromAddress,
+        subject: replySubject,
+        inReplyTo: parsed.messageId,
+        references: parsed.messageId,
+        text: [
+          'שלום,',
+          '',
+          'הקישורים מוכנים:',
+          '',
+          `צפייה: ${previewLink}`,
+          `הורדה ישירה: ${downloadLink}`,
+          '',
+          '(מייל אוטומטי)'
+        ].join('\n')
+      });
+
+      await client.messageFlagsAdd(uid, [PROCESSED_FLAG]);
+      console.log(`UID ${uid}: נשלחה תשובה אל ${fromAddress} עבור fileId=${fileId}`);
     }
-
-    const previewLink = `${DOWNLOAD_SERVER}/preview/${fileId}`;
-    const downloadLink = `${DOWNLOAD_SERVER}/download/${fileId}`;
-
-    const replyBody = [
-      'שלום,',
-      '',
-      'הקישורים מוכנים:',
-      '',
-      `צפייה: ${previewLink}`,
-      `הורדה ישירה: ${downloadLink}`,
-      '',
-      '(מייל אוטומטי)'
-    ].join('\n');
-
-    const raw = buildReplyRaw({ to: from, subject, inReplyTo: messageIdHeader, bodyText: replyBody });
-
-    await gmail.users.messages.send({
-      userId: 'me',
-      requestBody: { raw, threadId: m.threadId }
-    });
-
-    await gmail.users.messages.modify({ userId: 'me', id: m.id, requestBody: { addLabelIds: [labelId] } });
-
-    console.log(`מייל ${m.id}: נשלחה תשובה עם קישורים עבור fileId=${fileId}`);
+  } finally {
+    lock.release();
   }
+
+  await client.logout();
 }
 
 main().catch((err) => {
